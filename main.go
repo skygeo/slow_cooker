@@ -219,16 +219,21 @@ func loadData(data string) []byte {
 }
 
 var (
-	promRequests = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "requests",
-		Help: "Number of requests",
-	})
+	promRequests = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "http_requests_total",
+			Help: "Number of requests",
+		},
+		[]string{"code"},
+	)
 
-	promSuccesses = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "successes",
-		Help: "Number of successful requests",
-	})
-
+	promActiveRequests = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "http_active_requests",
+			Help: "number of active http requests",
+		},
+	)
+	
 	promLatencyHistogram = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: "latency_ms",
 		Help: "RPC latency distributions in milliseconds.",
@@ -240,7 +245,7 @@ var (
 
 func registerMetrics() {
 	prometheus.MustRegister(promRequests)
-	prometheus.MustRegister(promSuccesses)
+	prometheus.MustRegister(promActiveRequests)
 	prometheus.MustRegister(promLatencyHistogram)
 }
 
@@ -337,6 +342,9 @@ func main() {
 	fmt.Printf("# %s good/b/f t   goal%% %s min [p50 p95 p99  p999]  max bhash change\n", timePadding, intPadding)
 	for i := 0; i < *concurrency; i++ {
 		ticker := time.NewTicker(timeToWait)
+		if ! *noreuse {
+			promActiveRequests.Inc()
+		}
 		go func() {
 			// For each goroutine we want to reuse a buffer for performance reasons.
 			bodyBuffer := make([]byte, 50000)
@@ -352,7 +360,9 @@ func main() {
 				shouldFinishLock.RLock()
 				if !shouldFinish {
 					shouldFinishLock.RUnlock()
+					if *noreuse { promActiveRequests.Inc() }
 					sendRequest(client, *method, dstURL, hosts[rand.Intn(len(hosts))], headers, requestData, atomic.AddUint64(&reqID, 1), *noreuse, *hashValue, checkHash, hasher, received, bodyBuffer)
+					if *noreuse { promActiveRequests.Dec() }
 				} else {
 					shouldFinishLock.RUnlock()
 					sendTraffic.Done()
@@ -447,7 +457,7 @@ func main() {
 			}
 		case managedResp := <-received:
 			count++
-			promRequests.Inc()
+			promRequests.With(prometheus.Labels{"code": strconv.Itoa(managedResp.code)}).Inc()
 			if managedResp.err != nil {
 				fmt.Fprintln(os.Stderr, managedResp.err)
 				failed++
@@ -458,7 +468,6 @@ func main() {
 				}
 				if managedResp.code >= 200 && managedResp.code < 500 {
 					good++
-					promSuccesses.Inc()
 					promLatencyHistogram.Observe(float64(managedResp.latency))
 				} else {
 					bad++
